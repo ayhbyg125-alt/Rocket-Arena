@@ -2,7 +2,9 @@ import type { Room } from 'colyseus.js';
 import type { InputCommandV2, InputPayload } from '@rocket-arena/shared';
 import {
   InputController,
+  NEUTRAL_GAMEPAD,
   isEditableTarget,
+  sampleFromGamepad,
   type AxisInversion,
 } from './input-controller.js';
 
@@ -96,8 +98,18 @@ export function getCurrentInputCommandV2(): Readonly<InputCommandV2> {
   return controller.getPayload();
 }
 
+/** Read the first connected standard-mapping controller, if any. */
+function pollGamepad(): void {
+  if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') return;
+  const pad = Array.from(navigator.getGamepads()).find(
+    (candidate) => candidate !== null && candidate.connected && candidate.mapping === 'standard',
+  );
+  controller.setGamepad(pad && !inputSuspended ? sampleFromGamepad(pad) : NEUTRAL_GAMEPAD);
+}
+
 /** Send current input when changed, on room entry, or on the input heartbeat. */
 export function sendInput(room: Room | null): void {
+  pollGamepad();
   if (!room) {
     activeRoom = null;
     controller.detachRoom();
