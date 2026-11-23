@@ -82,6 +82,67 @@ export function isEditableTarget(target: EventTarget | null): boolean {
     && candidate.closest('input, textarea, select, [contenteditable="true"]') !== null;
 }
 
+/** One frame of controller input, already reduced to what the game needs. */
+export interface GamepadSample {
+  /** Left stick X, right is positive. */
+  readonly stickX: number;
+  /** Left stick Y, up is positive. */
+  readonly stickY: number;
+  /** Right trigger minus left trigger, -1..1. */
+  readonly throttle: number;
+  readonly jump: boolean;
+  readonly boost: boolean;
+  readonly powerslide: boolean;
+  readonly camera: boolean;
+  readonly rollLeft: boolean;
+  readonly rollRight: boolean;
+}
+
+export const NEUTRAL_GAMEPAD: GamepadSample = Object.freeze({
+  stickX: 0, stickY: 0, throttle: 0,
+  jump: false, boost: false, powerslide: false, camera: false,
+  rollLeft: false, rollRight: false,
+});
+
+const STICK_DEADZONE = 0.15;
+
+/** Remove stick drift, rescale the rest to 0..1, and round to cut input chatter. */
+export function applyDeadzone(value: number, deadzone = STICK_DEADZONE): number {
+  const magnitude = Math.abs(value);
+  if (!Number.isFinite(value) || magnitude <= deadzone) return 0;
+  const scaled = Math.min(1, (magnitude - deadzone) / (1 - deadzone));
+  return Math.sign(value) * Math.round(scaled * 100) / 100;
+}
+
+interface PadLike {
+  readonly axes: readonly number[];
+  readonly buttons: readonly { readonly pressed: boolean; readonly value: number }[];
+}
+
+/**
+ * Standard-mapping layout (Xbox, PlayStation and most iPad-compatible pads):
+ * A/Cross jump, B/Circle boost, X/Square powerslide, Y/Triangle ball cam,
+ * LB/RB air roll left/right, LT/RT brake/accelerate, left stick steer and pitch.
+ */
+export function sampleFromGamepad(pad: PadLike): GamepadSample {
+  const button = (index: number): boolean => pad.buttons[index]?.pressed === true;
+  const trigger = (index: number): number => {
+    const b = pad.buttons[index];
+    return b ? (b.value > 0 ? b.value : b.pressed ? 1 : 0) : 0;
+  };
+  return Object.freeze({
+    stickX: applyDeadzone(pad.axes[0] ?? 0),
+    stickY: applyDeadzone(-(pad.axes[1] ?? 0)),
+    throttle: applyDeadzone(trigger(7) - trigger(6), 0.05),
+    jump: button(0),
+    boost: button(1),
+    powerslide: button(2),
+    camera: button(3),
+    rollLeft: button(4),
+    rollRight: button(5),
+  });
+}
+
 /** Pure keyboard/input transport state used by browser bindings and tests. */
 export class InputController {
   private readonly heldCodes = new Set<string>();
@@ -92,6 +153,9 @@ export class InputController {
   private lastSentAt = Number.NEGATIVE_INFINITY;
   private forceNextSend = true;
   private axisInversion: AxisInversion = NO_AXIS_INVERSION;
+  private gamepad: GamepadSample = NEUTRAL_GAMEPAD;
+  private padJumpHeld = false;
+  private padCameraHeld = false;
 
   /**
    * Adopt an axis-inversion preference.
@@ -120,6 +184,19 @@ export class InputController {
     return this.axisInversion;
   }
 
+  /**
+   * Adopt this frame's controller state. Jump and camera presses are counted
+   * on the rising edge, exactly like a keyboard press, so a held button never
+   * repeats.
+   */
+  setGamepad(sample: GamepadSample): void {
+    if (sample.jump && !this.padJumpHeld) this.jumpSequence += 1;
+    if (sample.camera && !this.padCameraHeld) this.cameraToggleSequence += 1;
+    this.padJumpHeld = sample.jump;
+    this.padCameraHeld = sample.camera;
+    this.gamepad = sample;
+  }
+
   handleKeyDown(code: string, repeat = false): boolean {
     if (!GAMEPLAY_CODES.has(code)) return false;
 
@@ -139,6 +216,7 @@ export class InputController {
   /** Clear held controls without erasing monotonic physical-edge floors. */
   resetHeldKeys(): void {
     this.heldCodes.clear();
+    this.gamepad = NEUTRAL_GAMEPAD;
     this.forceNextSend = true;
   }
 
@@ -164,18 +242,26 @@ export class InputController {
     if (this.heldCodes.has('KeyE')) yaw = 1;
     else if (this.heldCodes.has('KeyQ')) yaw = -1;
 
-    // Applied once, here, so pitch and roll below inherit the same flip as the
-    // ground axis they are read from; a player who inverts W/S gets an inverted
-    // nose in the air too, because it is the same physical axis. The zero guards
-    // keep a neutral axis at exactly 0 rather than -0.
-    // Inversion lands on the airborne axes only, which needs no knowledge of
-    // whether the car is grounded: the server reads pitch, roll, and yaw solely
-    // while a car is off the ground, so flipping them is air-only for free.
-    // Throttle and steer are deliberately left alone, because inverted steering on
-    // the ground is not what anyone is asking for when they invert a flight axis.
-    // The zero guards keep a neutral axis at exactly 0 rather than -0.
-    const pitch = this.axisInversion.pitch && throttle !== 0 ? -throttle : throttle;
-    const roll = this.axisInversion.roll && steer !== 0 ? -steer : steer;
+    // Keyboard wins when it is pressed; otherwise the controller supplies the
+    // axis. W/S double as throttle and pitch, A/D as steer and air roll.
+    const pad = this.gamepad;
+    let pitchInput = throttle;
+    let rollInput = steer;
+    if (throttle === 0) {
+      throttle = pad.throttle;
+      pitchInput = pad.stickY;
+    }
+    if (steer === 0) {
+      steer = pad.stickX === 0 ? 0 : -pad.stickX; // never -0
+      rollInput = (pad.rollLeft ? 1 : 0) - (pad.rollRight ? 1 : 0);
+    }
+    if (yaw === 0) yaw = pad.stickX;
+
+    // Inversion lands on the airborne axes only: the server reads pitch, roll,
+    // and yaw solely while a car is off the ground. Zero guards keep a neutral
+    // axis at exactly 0 rather than -0.
+    const pitch = this.axisInversion.pitch && pitchInput !== 0 ? -pitchInput : pitchInput;
+    const roll = this.axisInversion.roll && rollInput !== 0 ? -rollInput : rollInput;
     if (this.axisInversion.airYaw && yaw !== 0) yaw = -yaw;
 
     return Object.freeze({
@@ -185,10 +271,10 @@ export class InputController {
       pitch,
       yaw,
       roll,
-      jumpHeld: this.heldCodes.has('Space'),
+      jumpHeld: this.heldCodes.has('Space') || pad.jump,
       jumpSequence: this.jumpSequence,
-      boostHeld: this.heldCodes.has('ShiftLeft') || this.heldCodes.has('ShiftRight'),
-      powerslideHeld: this.heldCodes.has('ControlLeft') || this.heldCodes.has('ControlRight'),
+      boostHeld: this.heldCodes.has('ShiftLeft') || this.heldCodes.has('ShiftRight') || pad.boost,
+      powerslideHeld: this.heldCodes.has('ControlLeft') || this.heldCodes.has('ControlRight') || pad.powerslide,
       cameraToggleSequence: this.cameraToggleSequence,
     });
   }
